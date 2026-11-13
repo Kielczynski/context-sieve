@@ -9,7 +9,9 @@ that extract plus the path of a temp file holding the full output.
 
 - `Bash` stdout, `Grep` content, `WebFetch` results
 - text results of MCP (connector) tools
-- not `Read`: file edits need the exact text
+- `Read` only if you turn it on (experimental, see Options): whole-file reads of
+  large text files are filtered with their line numbers kept; reads with
+  `offset`/`limit` never are, so the exact text is there before an edit
 
 If the filter fails, says everything matters, or would cut less than 30%, the
 output passes through unchanged.
@@ -36,8 +38,14 @@ The repository is private: the machine needs a git credential for github.com
 
 ## Use
 
-- `/sieve` shows how many outputs were filtered, tokens saved and tokens the filter used
+- `/sieve` shows, for this session and for all sessions together, how many outputs
+  were filtered, tokens saved, what the filter cost and the net
 - `/sieve off` and `/sieve on` switch it for the session
+- `/sieve reset` clears the all-sessions totals
+
+The net figure counts each saved token once, in main-model input tokens, and
+prices the filter at `priceRatio` of the main model. Saved tokens would also be
+re-read on later turns, so the real saving is higher.
 
 ## Options
 
@@ -46,6 +54,11 @@ The repository is private: the machine needs a git credential for github.com
 | `threshold` | 20000 | Outputs longer than this many characters are filtered (about 4 characters per token) |
 | `model` | `haiku` | Model alias or id that filters |
 | `mcp` | true | Also filter MCP tool results |
+| `read` | false | Experimental: also filter whole-file `Read` of large text files |
+| `readThreshold` | 40000 | Threshold in characters for those reads |
+| `priceRatio` | 0.2 | Filter model's price as a share of the main model's, for the net figure |
+
+Change them with `/plugin configure context-sieve@context-sieve`.
 
 ## Develop
 

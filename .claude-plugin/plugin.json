@@ -1,6 +1,6 @@
 {
   "name": "context-sieve",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A cheaper model filters large tool outputs down to what the current task needs before they enter the main model's context.",
   "userConfig": {
     "threshold": {
@@ -20,6 +20,24 @@
       "title": "Filter MCP tools",
       "description": "Also filter text results of MCP (connector) tools.",
       "default": true
+    },
+    "read": {
+      "type": "boolean",
+      "title": "Filter whole-file reads (experimental)",
+      "description": "Also filter Read of a whole large text file. Reads with offset/limit are never filtered.",
+      "default": false
+    },
+    "readThreshold": {
+      "type": "number",
+      "title": "Read threshold (characters)",
+      "description": "Whole-file reads longer than this are filtered when Read filtering is on.",
+      "default": 40000
+    },
+    "priceRatio": {
+      "type": "number",
+      "title": "Filter price ratio",
+      "description": "The filter model's price as a share of the main model's, used for the net figure in /sieve.",
+      "default": 0.2
     }
   }
 }

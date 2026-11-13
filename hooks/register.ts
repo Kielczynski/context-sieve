@@ -97,44 +97,138 @@ export const locate = (
   return undefined
 }
 
+/**
+ * A whole-file Read of text, its lines prefixed with their own numbers so
+ * they survive the cut; undefined for a ranged read (the agent asked for
+ * exact lines, usually before an edit), a PDF, an image or a notebook.
+ */
+export const locateRead = (
+  e: Record<string, unknown>,
+  result: unknown,
+): Slot | undefined => {
+  const isWhole =
+    e.offset === undefined &&
+    e.limit === undefined &&
+    e.pages === undefined &&
+    e.allow_large !== true
+  if (!isWhole || !isRecord(result) || result.type !== 'text') return undefined
+
+  const file = result.file
+  if (!isRecord(file) || typeof file.content !== 'string') return undefined
+
+  const first = typeof file.startLine === 'number' ? file.startLine : 1
+
+  return {
+    text: file.content
+      .split('\n')
+      .map((line, i) => `L${first + i}: ${line}`)
+      .join('\n'),
+    put: content => ({
+      ...result,
+      file: { ...file, content, numLines: content.split('\n').length },
+    }),
+  }
+}
+
+const READ_RULES = `
+This output is a file. Every line starts with its own line number as "L<n>: ";
+keep that prefix on each line you copy.`
+
 const describeCall = (e: Record<string, unknown>): string => {
   const { tool, tool_use_id: _id, agentId: _agent, requestMeta: _meta, ...args } = e
 
   return `${String(tool)} ${JSON.stringify(args).slice(0, 2000)}`
 }
 
-const tokens = (chars: number): number => Math.round(chars / 4)
+type Totals = {
+  filtered: number
+  passed: number
+  /** Tokens kept out of the main model's context, by the filter's own count. */
+  saved: number
+  spentIn: number
+  spentOut: number
+}
+
+const ZERO: Totals = { filtered: 0, passed: 0, saved: 0, spentIn: 0, spentOut: 0 }
+const KEY = 'totals'
+
+/** What an earlier version, or anything else, left in the store: read as built. */
+export const asTotals = (v: unknown): Totals => {
+  if (!isRecord(v)) return { ...ZERO }
+
+  const n = (x: unknown): number => (typeof x === 'number' && Number.isFinite(x) ? x : 0)
+
+  return {
+    filtered: n(v.filtered),
+    passed: n(v.passed),
+    saved: n(v.saved),
+    spentIn: n(v.spentIn),
+    spentOut: n(v.spentOut),
+  }
+}
+
+const add = (a: Totals, b: Totals): Totals => ({
+  filtered: a.filtered + b.filtered,
+  passed: a.passed + b.passed,
+  saved: a.saved + b.saved,
+  spentIn: a.spentIn + b.spentIn,
+  spentOut: a.spentOut + b.spentOut,
+})
+
+// An output token is priced at about five input tokens.
+const OUTPUT_WEIGHT = 5
 
 export const register: Register = (on, options) => {
   const threshold = Number(options.threshold ?? 20000)
   const model = String(options.model ?? 'haiku')
   const hasMcp = options.mcp !== false
+  const hasRead = options.read === true
+  const readThreshold = Number(options.readThreshold ?? 40000)
+  // The filter model's price as a share of the main model's.
+  const priceRatio = Number(options.priceRatio ?? 0.2)
 
   // Per loop (the main one, or a subagent's id): what it was last asked to do.
   const tasks = new Map<string, string>()
-  const stats = { filtered: 0, passed: 0, savedChars: 0, spentIn: 0, spentOut: 0 }
+  let session: Totals = { ...ZERO }
   let isOn = true
+  // One write to the store at a time, so parallel tool calls lose no count.
+  let writing: Promise<unknown> = Promise.resolve()
+
+  /** The filter's cost in main-model input tokens. */
+  const cost = (t: Totals): number =>
+    Math.round((t.spentIn + OUTPUT_WEIGHT * t.spentOut) * priceRatio)
+
+  const line = (label: string, t: Totals): string =>
+    `${label}: ${t.filtered} filtered, ${t.passed} left whole; saved ~${t.saved} tokens, ` +
+    `filter cost ~${cost(t)} (${t.spentIn} in + ${t.spentOut} out on ${model}), ` +
+    `net ~${t.saved - cost(t)}.`
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'sieve',
       description: 'Context sieve: show what it saved, or turn it on/off',
-      argumentHint: '[on|off]',
+      argumentHint: '[on|off|reset]',
     })
 
     return next(e)
   })
 
-  on('command.run', { command: 'sieve' }, (_, e) => {
+  on('command.run', { command: 'sieve' }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()
     if (arg === 'on' || arg === 'off') isOn = arg === 'on'
+    await writing
+    if (arg === 'reset') await $.store.delete(KEY)
+
+    const all = asTotals(await $.store.get(KEY))
 
     return {
       text: [
-        `context-sieve is ${isOn ? 'on' : 'off'} (model ${model}, threshold ${threshold} chars).`,
-        `Filtered ${stats.filtered} outputs, saved about ${tokens(stats.savedChars)} tokens of context.`,
-        `Left ${stats.passed} large outputs whole (little to cut, or the filter failed).`,
-        `The filter itself used ${stats.spentIn} input and ${stats.spentOut} output tokens.`,
+        `context-sieve is ${isOn ? 'on' : 'off'} (model ${model}, threshold ${threshold} chars, ` +
+          `Read ${hasRead ? `from ${readThreshold} chars` : 'not filtered'}).`,
+        line('This session', session),
+        line('All sessions', all),
+        `Net counts each saved token once, in main-model input tokens, with ${model} priced at ` +
+          `${priceRatio} of the main model; saved tokens would also be re-read on later turns, so it is a lower bound.`,
       ].join('\n'),
     }
   })
@@ -153,30 +247,44 @@ export const register: Register = (on, options) => {
     try {
       if (!isOn || ran.deny !== undefined || ran.isError === true) return ran
 
-      const slot = locate(e.tool, ran.result, hasMcp)
+      const input = e as unknown as Record<string, unknown>
+      const isRead = e.tool === 'Read'
+      if (isRead && !hasRead) return ran
+
+      const slot = isRead ? locateRead(input, ran.result) : locate(e.tool, ran.result, hasMcp)
       if (slot === undefined) return ran
 
       const size = slot.text.length
-      if (size < threshold || size > MAX_INPUT) return ran
+      if (size < (isRead ? readThreshold : threshold) || size > MAX_INPUT) return ran
 
-      const call = describeCall(e as unknown as Record<string, unknown>)
+      const call = describeCall(input)
       // The agent fetching an original this mod saved must get it whole.
       if (call.includes(DIR)) return ran
 
       const task = tasks.get(e.agentId ?? MAIN) ?? '(not known; keep anything that looks important)'
       const maxTokens = Math.min(32000, Math.ceil(size / 3))
+      const system = isRead ? RULES + READ_RULES : RULES
+      const prompt = `<task>\n${task}\n</task>\n\n<tool_call>\n${call}\n</tool_call>\n\n<output>\n${slot.text}\n</output>`
       const reply = await $.model.complete({
         model,
-        system: RULES,
-        prompt: `<task>\n${task}\n</task>\n\n<tool_call>\n${call}\n</tool_call>\n\n<output>\n${slot.text}\n</output>`,
+        system,
+        prompt,
         maxTokens,
         effort: 'low',
         timeoutMs: 60_000,
       })
 
-      if (reply.isAnswered) {
-        stats.spentIn += reply.usage.input_tokens
-        stats.spentOut += reply.usage.output_tokens
+      const spentIn = reply.isAnswered
+        ? reply.usage.input_tokens +
+          reply.usage.cache_read_input_tokens +
+          reply.usage.cache_creation_input_tokens
+        : 0
+      const spentOut = reply.isAnswered ? reply.usage.output_tokens : 0
+      const record = (delta: Totals): void => {
+        session = add(session, delta)
+        writing = writing
+          .then(async () => $.store.set(KEY, add(asTotals(await $.store.get(KEY)), delta)))
+          .catch(() => undefined)
       }
 
       const kept = reply.isAnswered ? reply.text.trim() : ''
@@ -188,7 +296,7 @@ export const register: Register = (on, options) => {
         kept.length <= size * MIN_GAIN
 
       if (!isUsable) {
-        stats.passed += 1
+        record({ ...ZERO, passed: 1, spentIn, spentOut })
         $.ui.log(
           `kept ${e.tool} output whole (${reply.isAnswered ? 'little to cut' : reply.reason})`,
           { to: 'debug' },
@@ -199,17 +307,23 @@ export const register: Register = (on, options) => {
 
       const tmp = (await $.env.get('TMPDIR')) ?? (await $.env.get('TEMP')) ?? '/tmp'
       const path = `${tmp.replace(/[\\/]+$/, '')}/${DIR}/${e.tool_use_id}.txt`
-      await $.fs.write(path, slot.text)
+      // A file is its own original; any other output is saved for the agent.
+      if (!isRead) await $.fs.write(path, slot.text)
 
-      const note = `[context-sieve: ${model} filtered this output from ${size} to ${kept.length} characters for the current task. Lines are verbatim; omissions are marked. The full output is in ${path} - read it if anything you need is missing.]`
+      const note = isRead
+        ? `[context-sieve: ${model} filtered this file view from ${size} to ${kept.length} characters for the current task. Lines are verbatim; omissions are marked; "L<n>:" is a line's number in the file. This is NOT the whole file: before editing it, Read the exact lines with offset and limit (ranged reads are never filtered).]`
+        : `[context-sieve: ${model} filtered this output from ${size} to ${kept.length} characters for the current task. Lines are verbatim; omissions are marked. The full output is in ${path} - read it if anything you need is missing.]`
+      const text = `${note}\n${kept}`
+      // The filter counted the output's tokens for us: its share of the prompt.
+      const outputTokens = spentIn * Math.min(1, size / (system.length + prompt.length))
+      const saved = Math.max(0, Math.round(outputTokens * (1 - text.length / size)))
 
-      stats.filtered += 1
-      stats.savedChars += size - kept.length
-      $.ui.status(`sieve: ~${tokens(stats.savedChars)} tokens saved`)
+      record({ ...ZERO, filtered: 1, saved, spentIn, spentOut })
+      $.ui.status(`sieve: ~${session.saved} tokens saved`)
 
-      return { result: slot.put(`${note}\n${kept}`), context: ran.context }
+      return { result: slot.put(text), context: ran.context }
     } catch (error) {
-      stats.passed += 1
+      session = add(session, { ...ZERO, passed: 1 })
       $.ui.log(`filter failed, output kept whole: ${String(error)}`, { to: 'debug' })
 
       return ran
