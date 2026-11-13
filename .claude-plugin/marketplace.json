@@ -1,0 +1,5 @@
+{
+  "name": "context-sieve",
+  "owner": { "name": "Kielczynski" },
+  "plugins": [{ "name": "context-sieve", "source": "./" }]
+}

@@ -1,0 +1,25 @@
+{
+  "name": "context-sieve",
+  "version": "0.1.0",
+  "description": "A cheaper model filters large tool outputs down to what the current task needs before they enter the main model's context.",
+  "userConfig": {
+    "threshold": {
+      "type": "number",
+      "title": "Threshold (characters)",
+      "description": "Tool outputs longer than this are filtered. About 4 characters make one token.",
+      "default": 20000
+    },
+    "model": {
+      "type": "string",
+      "title": "Filter model",
+      "description": "Model alias or id that does the filtering.",
+      "default": "haiku"
+    },
+    "mcp": {
+      "type": "boolean",
+      "title": "Filter MCP tools",
+      "description": "Also filter text results of MCP (connector) tools.",
+      "default": true
+    }
+  }
+}
